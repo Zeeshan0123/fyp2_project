@@ -1,0 +1,12 @@
+langchain
+llama-index
+ctransformers
+unstructured[md]
+sentence-transformers
+qdrant_client
+llama-cpp-python
+llama-index-embeddings-langchain
+llama-index-vector-stores-qdrant
+llama-index-postprocessor-flag-embedding-reranker
+llama-index-llms-langchain
+git+https://github.com/FlagOpen/FlagEmbedding.git
