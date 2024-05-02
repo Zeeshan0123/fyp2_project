@@ -1,0 +1,851 @@
+import nest_asyncio
+
+nest_asyncio.apply()
+
+import os
+
+from llama_parse import LlamaParse
+
+
+from llama_index.core import StorageContext
+from llama_index.core import set_global_service_context
+from llama_index.core import (
+    VectorStoreIndex,
+    SimpleDirectoryReader,
+    ServiceContext,
+)
+from langchain_community.llms import CTransformers
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import DirectoryLoader
+from langchain_community.vectorstores import Qdrant
+from llama_index.vector_stores.qdrant import QdrantVectorStore
+
+import qdrant_client
+from qdrant_client import models
+
+import pickle
+
+
+chapter_chunk_sizes = {
+    "chapter_1": 100,
+    "chapter_2": 400,
+    "chapter_3": 250,
+    "chapter_4": 300,
+    # Add more chapters as needed
+}
+
+chapter_no = input("Enter the chapter number (e.g., chapter_1, chapter_2): ")     # User input
+
+def load_or_parse_data(chapter_no):
+    data_file = f"./quiz_data/{chapter_no}.pkl"
+    # data_file = "./data/parsed_data.pkl"
+    
+    with open(data_file, "rb") as f:
+            parsed_data = pickle.load(f)
+            
+    return parsed_data
+    # if os.path.exists(data_file):
+    #     # Load the parsed data from the file
+    #     with open(data_file, "rb") as f:
+    #         parsed_data = pickle.load(f)
+    # else:
+    #     print("here sdfhsidfhjaksdf")
+
+def choose_chapter():
+    if chapter_no in chapter_chunk_sizes:
+        return chapter_chunk_sizes[chapter_no]
+    else:
+        print("Invalid chapter number. Please try again.")
+        # return choose_chapter()
+
+
+documents = load_or_parse_data(chapter_no)
+# chunk_size = choose_chapter()
+# print("Selected chapter chunk size:", chunk_size)
+
+from langchain_community.embeddings.huggingface import HuggingFaceEmbeddings
+embed_model = HuggingFaceEmbeddings(model_name='NeuML/pubmedbert-base-embeddings-matryoshka')
+
+collection_name="quiz_embeddings"
+url = "http://localhost:6333/dashboard"
+client =  qdrant_client.QdrantClient(
+    url=url,
+    prefer_grpc=False,
+    timeout=100       
+)
+
+client.create_collection(
+    collection_name=collection_name,
+    vectors_config=models.VectorParams(
+        size=768, distance=models.Distance.COSINE, on_disk=False
+    )
+)
+
+from llama_index.core import Settings
+Settings.embed_model = embed_model
+
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from llama_index.core.node_parser import LangchainNodeParser
+
+Settings.transformations = [LangchainNodeParser(RecursiveCharacterTextSplitter(chunk_size = 3000,chunk_overlap = 100))]
+
+vectorstore = QdrantVectorStore(
+    client=client, 
+    collection_name=collection_name,
+    embed_model=embed_model
+    # vector_name="base_nodes",
+    
+    
+)
+
+
+
+# raw_index = VectorStoreIndex.from_documents(documents,storage_context=storage_context)
+
+
+
+import asyncio
+from abc import abstractmethod
+from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
+
+import pandas as pd
+from tqdm import tqdm
+
+from llama_index.core.async_utils import DEFAULT_NUM_WORKERS, run_jobs
+from llama_index.core.base.response.schema import PydanticResponse
+from llama_index.core.bridge.pydantic import BaseModel, Field, ValidationError
+from llama_index.core.callbacks.base import CallbackManager
+from llama_index.core.llms.llm import LLM
+from llama_index.core.node_parser.interface import NodeParser
+from llama_index.core.schema import BaseNode, Document, IndexNode, TextNode
+from llama_index.core.utils import get_tqdm_iterable
+
+DEFAULT_SUMMARY_QUERY_STR = """\
+What is this table about? Give a very concise summary (imagine you are adding a new caption and summary for this table), \
+and output the real/existing table title/caption if context provided.\
+and output the real/existing table id if context provided.\
+and also output whether or not the table should be kept.\
+"""
+
+
+class TableColumnOutput(BaseModel):
+    """Output from analyzing a table column."""
+
+    col_name: str
+    col_type: str
+    summary: Optional[str] = None
+
+    def __str__(self) -> str:
+        """Convert to string representation."""
+        return (
+            f"Column: {self.col_name}\nType: {self.col_type}\nSummary: {self.summary}"
+        )
+
+
+class TableOutput(BaseModel):
+    """Output from analyzing a table."""
+
+    summary: str
+    table_title: Optional[str] = None
+    table_id: Optional[str] = None
+    columns: List[TableColumnOutput]
+
+
+class Element(BaseModel):
+    """Element object."""
+
+    id: str
+    type: str
+    element: Any
+    title_level: Optional[int] = None
+    table_output: Optional[TableOutput] = None
+    table: Optional[pd.DataFrame] = None
+
+    class Config:
+        arbitrary_types_allowed = True
+
+
+class BaseElementNodeParser(NodeParser):
+    """
+    Splits a document into Text Nodes and Index Nodes corresponding to embedded objects.
+
+    Supports text and tables currently.
+    """
+
+    callback_manager: CallbackManager = Field(
+        default_factory=CallbackManager, exclude=True
+    )
+    llm: Optional[LLM] = Field(
+        default=None, description="LLM model to use for summarization."
+    )
+    summary_query_str: str = Field(
+        default=DEFAULT_SUMMARY_QUERY_STR,
+        description="Query string to use for summarization.",
+    )
+    num_workers: int = Field(
+        default=DEFAULT_NUM_WORKERS,
+        description="Num of works for async jobs.",
+    )
+
+    show_progress: bool = Field(default=True, description="Whether to show progress.")
+
+    @classmethod
+    def class_name(cls) -> str:
+        return "BaseStructuredNodeParser"
+
+    @classmethod
+    def from_defaults(
+        cls,
+        callback_manager: Optional[CallbackManager] = None,
+        **kwargs: Any,
+    ) -> "BaseElementNodeParser":
+        callback_manager = callback_manager or CallbackManager([])
+
+        return cls(
+            callback_manager=callback_manager,
+            **kwargs,
+        )
+
+    def _parse_nodes(
+        self,
+        nodes: Sequence[BaseNode],
+        show_progress: bool = False,
+        **kwargs: Any,
+    ) -> List[BaseNode]:
+        all_nodes: List[BaseNode] = []
+        nodes_with_progress = get_tqdm_iterable(nodes, show_progress, "Parsing nodes")
+
+        for node in nodes_with_progress:
+            nodes = self.get_nodes_from_node(node)
+            all_nodes.extend(nodes)
+
+        return all_nodes
+
+    @abstractmethod
+    def get_nodes_from_node(self, node: TextNode) -> List[BaseNode]:
+        """Get nodes from node."""
+
+    @abstractmethod
+    def extract_elements(self, text: str, **kwargs: Any) -> List[Element]:
+        """Extract elements from text."""
+
+    def get_table_elements(self, elements: List[Element]) -> List[Element]:
+        """Get table elements."""
+        return [e for e in elements if e.type == "table" or e.type == "table_text"]
+
+    def get_text_elements(self, elements: List[Element]) -> List[Element]:
+        """Get text elements."""
+        # TODO: There we should maybe do something with titles
+        # and other elements in the future?
+        return [e for e in elements if e.type != "table"]
+
+    def extract_table_summaries(self, elements: List[Element]) -> None:
+        """Go through elements, extract out summaries that are tables."""
+        from llama_index.core.indices.list.base import SummaryIndex
+        from llama_index.core.service_context import ServiceContext
+        
+        llm = self.llm
+        ## Changes
+#         if self.llm:
+#             llm = self.llm
+#         else:
+#             try:
+#                 from llama_index.llms.openai import OpenAI  # pants: no-infer-dep
+#             except ImportError as e:
+#                 raise ImportError(
+#                     "`llama-index-llms-openai` package not found."
+#                     " Please install with `pip install llama-index-llms-openai`."
+#                 )
+#             llm = OpenAI()
+        llm = cast(LLM, llm)
+
+        service_context = ServiceContext.from_defaults(llm=llm, embed_model=None)
+
+        table_context_list = []
+        for idx, element in tqdm(enumerate(elements)):
+            if element.type not in ("table", "table_text"):
+                continue
+            table_context = str(element.element)
+            if idx > 0 and str(elements[idx - 1].element).lower().strip().startswith(
+                "table"
+            ):
+                table_context = str(elements[idx - 1].element) + "\n" + table_context
+            if idx < len(elements) + 1 and str(
+                elements[idx - 1].element
+            ).lower().strip().startswith("table"):
+                table_context += "\n" + str(elements[idx + 1].element)
+
+            table_context_list.append(table_context)
+        
+        ## Changes
+        async def _get_table_output(table_context: str, summary_query_str: str) -> Any:
+#             index = SummaryIndex.from_documents(
+#                 [Document(text=table_context)], service_context=service_context
+#             )
+#             query_engine = index.as_query_engine(llm=llm, output_cls=TableOutput)
+#             try:
+#                 response = await query_engine.aquery(summary_query_str)
+#                 return cast(PydanticResponse, response).response
+#             except ValidationError:
+#                 # There was a pydantic validation error, so we will run with text completion
+#                 # fill in the summary and leave other fields blank
+#                 query_engine = index.as_query_engine()
+#                 response_txt = await query_engine.aquery(summary_query_str)
+            return TableOutput(summary=str(table_context), columns=[])
+
+        summary_jobs = [
+            _get_table_output(table_context, self.summary_query_str)
+            for table_context in table_context_list
+        ]
+        summary_outputs = asyncio.run(
+            run_jobs(
+                summary_jobs, show_progress=self.show_progress, workers=self.num_workers
+            )
+        )
+        for element, summary_output in zip(elements, summary_outputs):
+            element.table_output = summary_output
+
+    def get_base_nodes_and_mappings(
+        self, nodes: List[BaseNode]
+    ) -> Tuple[List[BaseNode], Dict]:
+        """Get base nodes and mappings.
+
+        Given a list of nodes and IndexNode objects, return the base nodes and a mapping
+        from index id to child nodes (which are excluded from the base nodes).
+
+        """
+        node_dict = {node.node_id: node for node in nodes}
+
+        node_mappings = {}
+        base_nodes = []
+
+        # first map index nodes to their child nodes
+        nonbase_node_ids = set()
+        for node in nodes:
+            if isinstance(node, IndexNode):
+                node_mappings[node.index_id] = node_dict[node.index_id]
+                nonbase_node_ids.add(node.index_id)
+            else:
+                pass
+
+        # then add all nodes that are not children of index nodes
+        for node in nodes:
+            if node.node_id not in nonbase_node_ids:
+                base_nodes.append(node)
+
+        return base_nodes, node_mappings
+
+    def get_nodes_and_objects(
+        self, nodes: List[BaseNode]
+    ) -> Tuple[List[BaseNode], List[IndexNode]]:
+        base_nodes, node_mappings = self.get_base_nodes_and_mappings(nodes)
+
+        nodes = []
+        objects = []
+        for node in base_nodes:
+            if isinstance(node, IndexNode):
+                node.obj = node_mappings[node.index_id]
+                objects.append(node)
+            else:
+                nodes.append(node)
+
+        return nodes, objects
+
+    def _get_nodes_from_buffer(
+        self, buffer: List[str], node_parser: NodeParser
+    ) -> List[BaseNode]:
+        """Get nodes from buffer."""
+        doc = Document(text="\n\n".join(list(buffer)))
+        return node_parser.get_nodes_from_documents([doc])
+
+    def get_nodes_from_elements(self, elements: List[Element]) -> List[BaseNode]:
+        """Get nodes and mappings."""
+        # from llama_index.core.node_parser import SentenceSplitter
+
+        # node_parser = SentenceSplitter()
+        from langchain.text_splitter import RecursiveCharacterTextSplitter
+        from llama_index.core.node_parser import LangchainNodeParser
+        
+        node_parser = LangchainNodeParser(RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=70)) #here we change the Sentence splitter into Recursive character splitter
+        
+        nodes = []
+        cur_text_el_buffer: List[str] = []
+        for element in elements:
+            if element.type == "table" or element.type == "table_text":
+                # flush text buffer for table
+                if len(cur_text_el_buffer) > 0:
+                    cur_text_nodes = self._get_nodes_from_buffer(
+                        cur_text_el_buffer, node_parser
+                    )
+                    nodes.extend(cur_text_nodes)
+                    cur_text_el_buffer = []
+
+                table_output = cast(TableOutput, element.table_output)
+                table_md = ""
+                if element.type == "table":
+                    table_df = cast(pd.DataFrame, element.table)
+                    # We serialize the table as markdown as it allow better accuracy
+                    # We do not use the table_df.to_markdown() method as it generate
+                    # a table with a token hungry format.
+                    table_md = "|"
+                    for col_name, col in table_df.items():
+                        table_md += f"{col_name}|"
+                    table_md += "\n|"
+                    for col_name, col in table_df.items():
+                        table_md += f"---|"
+                    table_md += "\n"
+                    for row in table_df.itertuples():
+                        table_md += "|"
+                        for col in row[1:]:
+                            table_md += f"{col}|"
+                        table_md += "\n"
+                elif element.type == "table_text":
+                    # if the table is non-perfect table, we still want to keep the original text of table
+                    table_md = str(element.element)
+                table_id = element.id + "_table"
+                table_ref_id = element.id + "_table_ref"
+
+                col_schema = "\n\n".join([str(col) for col in table_output.columns])
+
+                # We build a summary of the table containing the extracted summary, and a description of the columns
+                table_summary = str(table_output.summary)
+                if table_output.table_title:
+                    table_summary += ",\nwith the following table title:\n"
+                    table_summary += str(table_output.table_title)
+
+                table_summary += ",\nwith the following columns:\n"
+
+                for col in table_output.columns:
+                    table_summary += f"- {col.col_name}: {col.summary}\n"
+
+                index_node = IndexNode(
+                    text=table_summary,
+                    metadata={"col_schema": col_schema},
+                    excluded_embed_metadata_keys=["col_schema"],
+                    id_=table_ref_id,
+                    index_id=table_id,
+                )
+
+                table_str = table_summary + "\n" + table_md
+
+                text_node = TextNode(
+                    text=table_str,
+                    id_=table_id,
+                    metadata={
+                        # serialize the table as a dictionary string for dataframe of perfect table
+                        "table_df": (
+                            str(table_df.to_dict())
+                            if element.type == "table"
+                            else table_md
+                        ),
+                        # add table summary for retrieval purposes
+                        "table_summary": table_summary,
+                    },
+                    excluded_embed_metadata_keys=["table_df", "table_summary"],
+                    excluded_llm_metadata_keys=["table_df", "table_summary"],
+                )
+                nodes.extend([index_node, text_node])
+            else:
+                cur_text_el_buffer.append(str(element.element))
+        # flush text buffer
+        if len(cur_text_el_buffer) > 0:
+            cur_text_nodes = self._get_nodes_from_buffer(
+                cur_text_el_buffer, node_parser
+            )
+            nodes.extend(cur_text_nodes)
+            cur_text_el_buffer = []
+
+        # remove empty nodes
+        return [node for node in nodes if len(node.text) > 0]
+    
+
+
+
+
+
+
+from io import StringIO
+from typing import Any, Callable, List, Optional
+
+import pandas as pd
+from llama_index.core.node_parser.relational.base_element import (
+#     BaseElementNodeParser,
+    Element,
+)
+from llama_index.core.schema import BaseNode, TextNode
+
+
+def md_to_df(md_str: str) -> pd.DataFrame:
+    """Convert Markdown to dataframe."""
+    # Replace " by "" in md_str
+    md_str = md_str.replace('"', '""')
+
+    # Replace markdown pipe tables with commas
+    md_str = md_str.replace("|", '","')
+
+    # Remove the second line (table header separator)
+    lines = md_str.split("\n")
+    md_str = "\n".join(lines[:1] + lines[2:])
+
+    # Remove the first and last second char of the line (the pipes, transformed to ",")
+    lines = md_str.split("\n")
+    md_str = "\n".join([line[2:-2] for line in lines])
+
+    # Check if the table is empty
+    if len(md_str) == 0:
+        return None
+
+    # Use pandas to read the CSV string into a DataFrame
+    return pd.read_csv(StringIO(md_str))
+
+
+class MarkdownElementNodeParser(BaseElementNodeParser):
+    """Markdown element node parser.
+
+    Splits a markdown document into Text Nodes and Index Nodes corresponding to embedded objects
+    (e.g. tables).
+
+    """
+
+    @classmethod
+    def class_name(cls) -> str:
+        return "MarkdownElementNodeParser"
+
+    def get_nodes_from_node(self, node: TextNode) -> List[BaseNode]:
+        """Get nodes from node."""
+        elements = self.extract_elements(
+            node.get_content(),
+            table_filters=[self.filter_table],
+            node_id=node.id_,
+        )
+        table_elements = self.get_table_elements(elements)
+        # extract summaries over table elements
+        self.extract_table_summaries(table_elements)
+        # convert into nodes
+        # will return a list of Nodes and Index Nodes
+        return self.get_nodes_from_elements(elements)
+
+    def extract_elements(
+        self,
+        text: str,
+        node_id: Optional[str] = None,
+        table_filters: Optional[List[Callable]] = None,
+        **kwargs: Any,
+    ) -> List[Element]:
+        # get node id for each node so that we can avoid using the same id for different nodes
+        """Extract elements from text."""
+        lines = text.split("\n")
+        currentElement = None
+
+        elements: List[Element] = []
+        # Then parse the lines
+        for line in lines:
+            if line.startswith("```"):
+                # check if this is the end of a code block
+                if currentElement is not None and currentElement.type == "code":
+                    elements.append(currentElement)
+                    currentElement = None
+                    # if there is some text after the ``` create a text element with it
+                    if len(line) > 3:
+                        elements.append(
+                            Element(
+                                id=f"id_{len(elements)}",
+                                type="text",
+                                element=line.lstrip("```"),
+                            )
+                        )
+
+                elif line.count("```") == 2 and line[-3] != "`":
+                    # check if inline code block (aka have a second ``` in line but not at the end)
+                    if currentElement is not None:
+                        elements.append(currentElement)
+                    currentElement = Element(
+                        id=f"id_{len(elements)}",
+                        type="code",
+                        element=line.lstrip("```"),
+                    )
+                elif currentElement is not None and currentElement.type == "text":
+                    currentElement.element += "\n" + line
+                else:
+                    if currentElement is not None:
+                        elements.append(currentElement)
+                    currentElement = Element(
+                        id=f"id_{len(elements)}", type="text", element=line
+                    )
+
+            elif currentElement is not None and currentElement.type == "code":
+                currentElement.element += "\n" + line
+
+            elif line.startswith("|"):
+                if currentElement is not None and currentElement.type != "table":
+                    if currentElement is not None:
+                        elements.append(currentElement)
+                    currentElement = Element(
+                        id=f"id_{len(elements)}", type="table", element=line
+                    )
+                elif currentElement is not None:
+                    currentElement.element += "\n" + line
+                else:
+                    currentElement = Element(
+                        id=f"id_{len(elements)}", type="table", element=line
+                    )
+            elif line.startswith("#"):
+                if currentElement is not None:
+                    elements.append(currentElement)
+                currentElement = Element(
+                    id=f"id_{len(elements)}",
+                    type="title",
+                    element=line.lstrip("#"),
+                    title_level=len(line) - len(line.lstrip("#")),
+                )
+            else:
+                if currentElement is not None and currentElement.type != "text":
+                    elements.append(currentElement)
+                    currentElement = Element(
+                        id=f"id_{len(elements)}", type="text", element=line
+                    )
+                elif currentElement is not None:
+                    currentElement.element += "\n" + line
+                else:
+                    currentElement = Element(
+                        id=f"id_{len(elements)}", type="text", element=line
+                    )
+        if currentElement is not None:
+            elements.append(currentElement)
+
+        for idx, element in enumerate(elements):
+            if element.type == "table":
+                should_keep = True
+                perfect_table = True
+
+                # verify that the table (markdown) have the same number of columns on each rows
+                table_lines = element.element.split("\n")
+                table_columns = [len(line.split("|")) for line in table_lines]
+                if len(set(table_columns)) > 1:
+                    # if the table have different number of columns on each rows, it's not a perfect table
+                    # we will store the raw text for such tables instead of converting them to a dataframe
+                    perfect_table = False
+
+                # verify that the table (markdown) have at least 2 rows
+                if len(table_lines) < 2:
+                    should_keep = False
+
+                # apply the table filter, now only filter empty tables
+                if should_keep and perfect_table and table_filters is not None:
+                    should_keep = all(tf(element) for tf in table_filters)
+
+                # if the element is a table, convert it to a dataframe
+                if should_keep:
+                    if perfect_table:
+                        table = md_to_df(element.element)
+
+                        elements[idx] = Element(
+                            id=f"id_{node_id}_{idx}" if node_id else f"id_{idx}",
+                            type="table",
+                            element=element,
+                            table=table,
+                        )
+                    else:
+                        # for non-perfect tables, we will store the raw text
+                        # and give it a different type to differentiate it from perfect tables
+                        elements[idx] = Element(
+                            id=f"id_{node_id}_{idx}" if node_id else f"id_{idx}",
+                            type="table_text",
+                            element=element.element,
+                            # table=table
+                        )
+                else:
+                    elements[idx] = Element(
+                        id=f"id_{node_id}_{idx}" if node_id else f"id_{idx}",
+                        type="text",
+                        element=element.element,
+                    )
+            else:
+                # if the element is not a table, keep it as to text
+                elements[idx] = Element(
+                    id=f"id_{node_id}_{idx}" if node_id else f"id_{idx}",
+                    type="text",
+                    element=element.element,
+                )
+
+        # merge consecutive text elements together for now
+        merged_elements: List[Element] = []
+        for element in elements:
+            if (
+                len(merged_elements) > 0
+                and element.type == "text"
+                and merged_elements[-1].type == "text"
+            ):
+                merged_elements[-1].element += "\n" + element.element
+            else:
+                merged_elements.append(element)
+        elements = merged_elements
+        return merged_elements
+
+    def filter_table(self, table_element: Any) -> bool:
+        """Filter tables."""
+        table_df = md_to_df(table_element.element)
+
+        # check if table_df is not None, has more than one row, and more than one column
+        return table_df is not None and not table_df.empty and len(table_df.columns) > 1
+
+
+# from llama_index.core import Settings
+Settings.llm = None
+
+node_parser = MarkdownElementNodeParser(llm = None, num_workers=8)
+nodes = node_parser.get_nodes_from_documents(documents, progress = True)
+
+storage_context = StorageContext.from_defaults(
+    vector_store=vectorstore
+)
+
+base_nodes, objects = node_parser.get_nodes_and_objects(nodes)
+
+from llama_index.core.schema import TextNode
+
+# nodes_1 = []
+# for idx, text_chunk in enumerate(base_nodes,documents):
+#     node = TextNode(
+#         text=documents,
+#         nodes=base_nodes,
+#         metadata={
+#             "chapter": "chapter_1_Intro"
+#         }
+#     )
+#     # src_doc_idx = doc_idxs[idx]
+#     # src_page = doc[src_doc_idx]
+#     nodes_1.append(node)
+
+# for node in base_nodes:
+#     node.metadata["chapter"] = "chapter_1_Intro"
+    
+for node in documents:
+    node.metadata["chapter"] = "chapter_1_Intro"
+
+
+
+recursive_index = VectorStoreIndex.from_documents(documents=documents, storage_context=storage_context)
+
+
+# from llama_index.core import Prompt
+
+# # Define a custom prompt
+# template = (
+#     "You are an Anatomy Expert that can genrate quizes of chapters"
+#     "We have provided context information below. \n"
+#     "---------------------\n"
+#     "{context_str}"
+#     "\n---------------------\n"
+#     "Use the following pieces of information to generate a quiz"
+#     "Make sure quiz will cover the entirety of the chapter, ensuring questions are drawn from various sections to offer a thorough understanding of the material."
+#     "Given this information, generate the quiz. The quiz should start with code word AI Demos: {query_str}\n"
+#     "Only return the helpful detailed Quiz."
+#     "Helpful Quiz:"
+# )
+# qa_template = Prompt(template)
+
+# recursive_query_engine = raw_index.as_query_engine(
+#     similarity_top_k=10,
+#     text_qa_template=qa_template,
+#     verbose=True,
+# )
+
+# response = recursive_query_engine.query("Generate the quiz for me from the whole chapter")
+# print(response)
+
+
+from langchain_community.llms import LlamaCpp
+
+local_llm = "BioMistral-7B.Q4_K_M.gguf"
+
+local_llm = LlamaCpp(
+    model_path= local_llm,
+    temperature=0.1,
+    max_tokens=3000,
+    top_p=1,
+    n_ctx = 5000
+)
+
+from llama_index.core import Settings
+Settings.llm = local_llm
+
+print("LLM Initialized....")
+
+
+
+
+
+
+from llama_index.core.selectors.pydantic_selectors import PydanticMultiSelector
+from llama_index.core.extractors import PydanticProgramExtractor
+from llama_index.core.evaluation import DatasetGenerator
+# from llama_index.llms import OpenAI
+from llama_index.core import ServiceContext
+
+# Define a selector to filter nodes based on metadata
+# selector = PydanticMultiSelector(
+#     metadata={"chapter": "chapter1"}
+# )
+
+# # Use the selector to retrieve nodes with the specified metadata
+
+# selected_nodes = selector.select(base_nodes)
+
+# Set context for llm provider
+# gpt_35_context = ServiceContext.from_defaults(
+#     llm=OpenAI(model="gpt-3.5-turbo", temperature=0.3)
+# )
+
+# Define the prompt for question generation
+# QUESTION_GEN_PROMPT = (
+#     "You are an Anatomy Expert that can generate quizes of chapters"
+#     "Using the provided context create a question that captures an important fact from the context."
+#     "Restrict the question to the context information provided."
+#     "Use the following pieces of information to generate a quiz"
+#     "Make sure quiz will cover the entirety of the chapter, ensuring questions are drawn from various sections to offer a thorough understanding of the material."
+#     "Only return the helpful detailed Quiz."
+#     "Helpful Quiz:"
+# )
+
+def select_nodes_by_metadata(nodes, metadata):
+    selected_nodes = [node for node in nodes if node.metadata == metadata]
+    return selected_nodes
+
+# Use the function to retrieve nodes with the specified metadata
+selected_nodes = select_nodes_by_metadata(base_nodes, {"chapter": "chapter_1_Intro"})
+
+
+# QUESTION_GEN_PROMPT = {
+#     "You are a Teacher/ Professor. Your task is to setup "
+#     "a quiz/examination." 
+#     "Using the provided context, formulate "
+#     "a single question that captures an important fact from the "
+#     "context. Restrict the question to the context information provided."
+#     "{query_str}"
+# }
+QUESTION_GEN_PROMPT = (
+    "You are a Teacher/ Professor. Your task is to setup "
+    "a quiz/examination. Using the provided context, formulate "
+    "a single question that captures an important fact from the "
+    "context. Restrict the question to the context information provided."
+)
+
+data_generator = DatasetGenerator.from_documents(
+    documents=documents,
+    question_gen_query=QUESTION_GEN_PROMPT,
+    num_questions_per_chunk=1
+    
+)
+
+# Instantiate DatasetGenerator
+eval_questions = data_generator.generate_questions_from_nodes()
+
+# Generate questions from nodes
+# questions = dataset_generator.generate_questions_from_nodes(num=50)
+
+# llm_responses = [local_llm.ask(node.get_text()) for node in selected_nodes]
+
+# print(llm_responses)
+
+print(eval_questions)
